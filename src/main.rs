@@ -1,3 +1,6 @@
+use cono::config;
+
 fn main() {
-    println!("Hello, world!");
+    let config = config::Config::new();
+    println!("{:?}", config); 
 }
