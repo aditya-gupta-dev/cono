@@ -1,6 +1,14 @@
-use cono::config;
+use std::process::ExitCode;
 
-fn main() {
-    let config = config::Config::new();
-    println!("{:?}", config); 
+use cono::{config::Config, run};
+
+fn main() -> ExitCode {
+    let config = Config::new();
+    match run(&config) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }
