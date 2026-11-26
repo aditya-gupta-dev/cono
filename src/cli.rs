@@ -10,6 +10,9 @@ Usage:
   cono init <name>         Create a new project in ./<name>
   cono help                Show this message
 
+  Credits: 
+  Github                   https://github.com/aditya-gupta-dev/cono.git
+
 Settings are read from the .cono file in the current directory.";
 
 #[derive(Debug, PartialEq, Eq)]
