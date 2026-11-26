@@ -1,5 +1,7 @@
 use std::{
+    borrow::Cow,
     collections::{HashSet, VecDeque},
+    ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
 };
@@ -27,7 +29,12 @@ pub struct Sources {
 }
 
 pub fn parse_includes(src: &str) -> Vec<Include> {
-    let spliced = src.replace("\\\r\n", "").replace("\\\n", "");
+    // Line splices are rare, so only copy the file when there is one.
+    let spliced = if src.contains("\\\n") || src.contains("\\\r\n") {
+        Cow::Owned(src.replace("\\\r\n", "").replace("\\\n", ""))
+    } else {
+        Cow::Borrowed(src)
+    };
     strip_comments(&spliced)
         .lines()
         .filter_map(parse_directive)
@@ -48,10 +55,8 @@ fn parse_directive(line: &str) -> Option<Include> {
     let rest = rest.trim_start();
     let (kind, close, body) = if let Some(body) = rest.strip_prefix('<') {
         (IncludeKind::System, '>', body)
-    } else if let Some(body) = rest.strip_prefix('"') {
-        (IncludeKind::Local, '"', body)
     } else {
-        return None;
+        (IncludeKind::Local, '"', rest.strip_prefix('"')?)
     };
 
     let path = &body[..body.find(close)?];
@@ -98,7 +103,8 @@ fn strip_comments(src: &str) -> String {
         }
     }
 
-    String::from_utf8_lossy(&out).into_owned()
+    // Reuses `out`'s buffer; only invalid UTF-8 in the source costs a copy.
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 fn copy_literal(b: &[u8], start: usize, quote: u8, out: &mut Vec<u8>) -> usize {
@@ -149,14 +155,9 @@ fn ends_with_alnum(out: &[u8]) -> bool {
     out.last().is_some_and(|c| c.is_ascii_alphanumeric())
 }
 
-pub fn collect(
-    entry: &Path,
-    include_dirs: &[PathBuf],
-    src_dirs: &[PathBuf],
-) -> io::Result<Sources> {
+pub fn collect(entry: &Path, include_dirs: &[&Path], src_dirs: &[&Path]) -> io::Result<Sources> {
     let mut sources = Sources::default();
     let mut seen: HashSet<PathBuf> = HashSet::new();
-    let mut seen_system: HashSet<String> = HashSet::new();
     let mut queue: VecDeque<(PathBuf, bool)> = VecDeque::new();
 
     let entry = entry.to_path_buf();
@@ -167,28 +168,19 @@ pub fn collect(
         let content = fs::read_to_string(&file)
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", file.display())))?;
 
-        if is_unit {
-            sources.units.push(file.clone());
-        } else {
-            sources.headers.push(file.clone());
-        }
-
         let dir = file.parent().unwrap_or(Path::new(""));
         for inc in parse_includes(&content) {
-            let mut search: Vec<&Path> = Vec::new();
-            if inc.kind == IncludeKind::Local {
-                search.push(dir);
-            }
-            search.extend(include_dirs.iter().map(PathBuf::as_path));
-
-            let Some(header) = search
-                .iter()
+            let local_dir = (inc.kind == IncludeKind::Local).then_some(dir);
+            let Some(header) = local_dir
+                .into_iter()
+                .chain(include_dirs.iter().copied())
                 .map(|d| d.join(&inc.path))
                 .find(|p| p.is_file())
             else {
                 match inc.kind {
+                    // A linear scan beats a HashSet<String> copy here: there are only a few dozen.
                     IncludeKind::System => {
-                        if seen_system.insert(inc.path.clone()) {
+                        if !sources.system.contains(&inc.path) {
                             sources.system.push(inc.path);
                         }
                     }
@@ -198,45 +190,53 @@ pub fn collect(
             };
 
             if seen.insert(fs::canonicalize(&header)?) {
-                if let Some(imp) = find_implementation(&header, include_dirs, src_dirs) {
-                    if seen.insert(fs::canonicalize(&imp)?) {
-                        queue.push_back((imp, true));
-                    }
+                if let Some(imp) = find_implementation(&header, include_dirs, src_dirs)
+                    && seen.insert(fs::canonicalize(&imp)?)
+                {
+                    queue.push_back((imp, true));
                 }
                 queue.push_back((header, false));
             }
+        }
+
+        if is_unit {
+            sources.units.push(file);
+        } else {
+            sources.headers.push(file);
         }
     }
 
     Ok(sources)
 }
 
-fn find_implementation(
-    header: &Path,
-    include_dirs: &[PathBuf],
-    src_dirs: &[PathBuf],
-) -> Option<PathBuf> {
+fn find_implementation(header: &Path, include_dirs: &[&Path], src_dirs: &[&Path]) -> Option<PathBuf> {
     let stem = header.file_stem()?;
     let header_dir = header.parent().unwrap_or(Path::new(""));
+    let sub = include_dirs.iter().find_map(|inc| header_dir.strip_prefix(inc).ok());
 
-    let mut dirs = vec![header_dir.to_path_buf()];
-    let sub = include_dirs
-        .iter()
-        .find_map(|inc| header_dir.strip_prefix(inc).ok());
-    for src in src_dirs {
-        if let Some(sub) = sub {
-            dirs.push(src.join(sub));
+    // header dir, then for each src dir: src/<sub>, src
+    let dirs = std::iter::once(Cow::Borrowed(header_dir)).chain(src_dirs.iter().flat_map(|&src| {
+        sub.map(|sub| Cow::Owned(src.join(sub)))
+            .into_iter()
+            .chain(std::iter::once(Cow::Borrowed(src)))
+    }));
+
+    // Build the file name once per extension. Not `with_extension`: that would
+    // turn `foo.test.h` into `foo.cpp` instead of `foo.test.cpp`.
+    let mut name = OsString::with_capacity(stem.len() + 4);
+    for dir in dirs {
+        for ext in SOURCE_EXTS {
+            name.clear();
+            name.push(stem);
+            name.push(".");
+            name.push(ext);
+            let path = dir.join(&name);
+            if path.is_file() {
+                return Some(path);
+            }
         }
-        dirs.push(src.clone());
     }
-
-    dirs.iter()
-        .flat_map(|d| {
-            SOURCE_EXTS
-                .iter()
-                .map(move |ext| d.join(stem).with_extension(ext))
-        })
-        .find(|p| p.is_file())
+    None
 }
 
 #[cfg(test)]
@@ -350,6 +350,18 @@ mod tests {
     }
 
     #[test]
+    fn dotted_header_name_finds_matching_source() {
+        let t = TempDir::new("dotted");
+        t.write("main.cpp", "#include \"foo.test.h\"\n");
+        t.write("foo.test.h", "");
+        t.write("foo.test.cpp", "");
+        t.write("foo.cpp", ""); // the old code wrongly picked this one
+        let r = &t.0;
+        let s = collect(&r.join("main.cpp"), &[], &[]).unwrap();
+        assert_eq!(s.units, vec![r.join("main.cpp"), r.join("foo.test.cpp")]);
+    }
+
+    #[test]
     fn collects_transitive_sources() {
         let t = TempDir::new("collect");
         t.write("main.cpp", "#include <iostream>\n#include \"util.h\"\n#include <net/socket.h>\n#include \"missing.h\"\n");
@@ -368,8 +380,8 @@ mod tests {
         let r = &t.0;
         let s = collect(
             &r.join("main.cpp"),
-            &[r.join("include"), r.to_path_buf()],
-            &[r.join("src")],
+            &[&r.join("include"), r],
+            &[&r.join("src")],
         )
         .unwrap();
 

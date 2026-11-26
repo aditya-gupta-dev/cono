@@ -4,3 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+
+# Small binary: cono's own work takes milliseconds next to the compiler,
+# so trading a little speed for size is free here.
+[profile.release]
+opt-level = "s"     # optimize for size ("z" is 1K smaller but ~35% slower)
+lto = true          # inline and dead-code-eliminate across crates, including std
+codegen-units = 1   # one unit so LTO sees everything
+panic = "abort"     # drop the unwinding machinery
+strip = true        # no symbol table / debug info

@@ -92,8 +92,8 @@ pub fn build(config: &Config) -> io::Result<PathBuf> {
 
     let sources = deps::collect(
         Path::new(&config.entry_point),
-        &[PathBuf::from(&config.include_dir)],
-        &[PathBuf::from(&config.src_dir)],
+        &[Path::new(&config.include_dir)],
+        &[Path::new(&config.src_dir)],
     )?;
 
     for (file, name) in &sources.unresolved {

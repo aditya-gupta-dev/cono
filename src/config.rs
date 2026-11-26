@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     ffi::OsStr,
     fmt::Debug,
     fs::{self},
@@ -34,7 +33,32 @@ impl Debug for Compiler {
     }
 }
 
-const CONFIG_FILE_PATH: &'static str = ".cono";
+const CONFIG_FILE_PATH: &str = ".cono";
+
+/// Case-insensitive match without allocating a lowercased copy.
+fn is_any(value: &str, names: &[&str]) -> bool {
+    names.iter().any(|name| value.eq_ignore_ascii_case(name))
+}
+
+fn parse_compiler(value: &str) -> Option<Compiler> {
+    if is_any(value, &["gcc", "g++", "gpp"]) {
+        Some(Compiler::GPP)
+    } else if is_any(value, &["clang", "clang++"]) {
+        Some(Compiler::ClANG)
+    } else {
+        None
+    }
+}
+
+fn parse_mode(value: &str) -> Option<CompilationMode> {
+    if is_any(value, &["debug", "d"]) {
+        Some(CompilationMode::DEBUG)
+    } else if is_any(value, &["release", "r"]) {
+        Some(CompilationMode::RELEASE)
+    } else {
+        None
+    }
+}
 
 #[derive(Debug)]
 pub struct Config {
@@ -65,64 +89,42 @@ impl Default for Config {
 
 impl Config {
     pub fn new() -> Self {
-        let default_config = Config::default();
+        let mut config = Config::default();
+        let Ok(content) = fs::read_to_string(CONFIG_FILE_PATH) else {
+            return config;
+        };
 
-        if let Ok(content) = fs::read_to_string(CONFIG_FILE_PATH) {
-            let mut hash_map: HashMap<String, String> =
-                HashMap::with_capacity(content.lines().count());
-            for line in content.lines() {
-                if let Some(pair) = line.split_once("=").map(|(k, v)| (k.trim(), v.trim())) {
-                    hash_map.insert(pair.0.into(), pair.1.into());
+        // Later lines win, so a repeated key overrides an earlier one.
+        for (key, value) in content.lines().filter_map(|line| line.split_once('=')) {
+            let value = value.trim();
+            match key.trim() {
+                "compiler" => {
+                    if let Some(compiler) = parse_compiler(value) {
+                        config.compiler = compiler;
+                    }
                 }
+                "mode" => {
+                    if let Some(mode) = parse_mode(value) {
+                        config.compilation_mode = mode;
+                    }
+                }
+                "libs" => {
+                    config.libs = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|lib| !lib.is_empty())
+                        .map(String::from)
+                        .collect();
+                }
+                "include_dir" => config.include_dir = value.into(),
+                "src_dir" => config.src_dir = value.into(),
+                "lib_dir" => config.lib_dir = value.into(),
+                "entry_point" => config.entry_point = value.into(),
+                "output" => config.output = (!value.is_empty()).then(|| value.into()),
+                _ => {}
             }
-
-            Config {
-                compiler: hash_map
-                    .get("compiler")
-                    .and_then(|c| match c.trim().to_ascii_lowercase().as_str() {
-                        "gcc" | "g++" | "gpp" => Some(Compiler::GPP),
-                        "clang" | "clang++" => Some(Compiler::ClANG),
-                        _ => None,
-                    })
-                    .unwrap_or(default_config.compiler),
-                compilation_mode: hash_map
-                    .get("mode")
-                    .and_then(|c| match c.trim().to_ascii_lowercase().as_str() {
-                        "debug" | "d" => Some(CompilationMode::DEBUG),
-                        "release" | "r" => Some(CompilationMode::RELEASE),
-                        _ => None,
-                    })
-                    .unwrap_or(default_config.compilation_mode),
-                libs: hash_map
-                    .get("libs")
-                    .map(|libs| {
-                        libs.split(",")
-                            .map(|f| f.trim().to_string())
-                            .filter(|f| !f.is_empty())
-                            .collect()
-                    })
-                    .unwrap_or(default_config.libs),
-                include_dir: hash_map
-                    .get("include_dir")
-                    .unwrap_or(&default_config.include_dir)
-                    .to_string(),
-                src_dir: hash_map
-                    .get("src_dir")
-                    .unwrap_or(&default_config.src_dir)
-                    .to_string(),
-                lib_dir: hash_map
-                    .get("lib_dir")
-                    .unwrap_or(&default_config.lib_dir)
-                    .to_string(),
-                entry_point: hash_map
-                    .get("entry_point")
-                    .unwrap_or(&default_config.entry_point)
-                    .to_string(),
-                output: hash_map.get("output").filter(|o| !o.is_empty()).cloned(),
-            }
-        } else {
-            default_config
         }
+        config
     }
 
     pub fn output_path(&self) -> PathBuf {
